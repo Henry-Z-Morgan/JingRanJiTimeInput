@@ -6,13 +6,6 @@ public enum TimeInputControlMode: Equatable, Sendable {
     case hour
     case minute
 
-    var displayName: String {
-        switch self {
-        case .fullTime: "完整时间"
-        case .hour: "小时"
-        case .minute: "分钟"
-        }
-    }
 }
 
 /// 数字键盘与小时/分钟滚轮的纯同步逻辑。
@@ -23,9 +16,12 @@ public struct TimeInputSynchronizer: Equatable {
     public private(set) var controlMode: TimeInputControlMode
     private var keyboardDigits = ""
 
-    public init(initialTime: TimeInput = TimeInput(hour: 9, minute: 0)!) {
+    public init(
+        initialTime: TimeInput = TimeInput(hour: 9, minute: 0)!,
+        controlMode: TimeInputControlMode = .fullTime
+    ) {
         time = initialTime
-        controlMode = .fullTime
+        self.controlMode = controlMode
     }
 
     public var text: String { time.formatted }

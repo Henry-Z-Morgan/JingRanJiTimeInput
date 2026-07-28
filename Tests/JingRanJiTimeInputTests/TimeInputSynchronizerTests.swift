@@ -39,4 +39,14 @@ final class TimeInputSynchronizerTests: XCTestCase {
         value.beginWheelDrag()
         XCTAssertEqual(value.controlMode, .fullTime)
     }
+
+    func testInitialControlModeCanBeConfigured() {
+        let value = TimeInputSynchronizer(
+            initialTime: TimeInput(hour: 13, minute: 43)!,
+            controlMode: .minute
+        )
+
+        XCTAssertEqual(value.time.formatted, "13:43")
+        XCTAssertEqual(value.controlMode, .minute)
+    }
 }
