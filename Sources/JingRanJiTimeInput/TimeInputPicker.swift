@@ -183,7 +183,7 @@ private struct SystemTimePicker: UIViewRepresentable {
         tap.cancelsTouchesInView = false
         tap.delegate = context.coordinator
         picker.addGestureRecognizer(tap)
-        context.coordinator.observeWheelPans(in: picker)
+        context.coordinator.observeWheelPansWhenReady(in: picker)
         container.selectionOverlay.apply(time: time, controlMode: controlMode, visible: showsSelectionOverlay, animated: false)
         container.requestSelectionOverlayAlignment()
         return container
@@ -193,7 +193,7 @@ private struct SystemTimePicker: UIViewRepresentable {
         let picker = container.picker
         context.coordinator.parent = self
         picker.layoutIfNeeded()
-        context.coordinator.observeWheelPans(in: picker)
+        context.coordinator.observeWheelPansWhenReady(in: picker)
         container.selectionOverlay.apply(time: time, controlMode: controlMode, visible: showsSelectionOverlay, animated: true)
         container.requestSelectionOverlayAlignment()
 
@@ -219,6 +219,8 @@ private struct SystemTimePicker: UIViewRepresentable {
         var displayedControlMode: TimeInputControlMode?
         var lastSelectionRequestID = 0
         private var observedPanIDs = Set<ObjectIdentifier>()
+        private let minimumWheelScrollViewCount = 2
+        private let maximumWheelObservationAttempts = 5
         private var tappedColumn: TimeInputControlMode?
         private var modeBeforeTap: TimeInputControlMode?
         private var ignoreTapUntil = Date.distantPast
@@ -256,8 +258,22 @@ private struct SystemTimePicker: UIViewRepresentable {
             ignoreTapUntil = Date().addingTimeInterval(0.4)
             parent.onWheelDragBegan()
         }
-        func observeWheelPans(in picker: UIView) {
-            scrollViews(in: picker).forEach { scrollView in
+        /// `UIPickerView` 的内部滚轮滚动视图会在首次布局后的后续 run loop 才生成。
+        /// 首次弹窗时若只立即安装一次监听，用户直接拖动会发生在监听尚未挂载的窗口内，
+        /// 从而错过第一笔滑动。等待两个滚轮均就绪后再绑定，且重试次数受限，避免长期轮询。
+        func observeWheelPansWhenReady(in picker: UIView, remainingAttempts: Int? = nil) {
+            picker.layoutIfNeeded()
+            let wheelScrollViews = scrollViews(in: picker)
+            guard wheelScrollViews.count >= minimumWheelScrollViewCount else {
+                let attempts = remainingAttempts ?? maximumWheelObservationAttempts
+                guard attempts > 0 else { return }
+                DispatchQueue.main.async { [weak self, weak picker] in
+                    guard let self, let picker else { return }
+                    self.observeWheelPansWhenReady(in: picker, remainingAttempts: attempts - 1)
+                }
+                return
+            }
+            wheelScrollViews.forEach { scrollView in
                 let id = ObjectIdentifier(scrollView.panGestureRecognizer)
                 guard observedPanIDs.insert(id).inserted else { return }
                 scrollView.panGestureRecognizer.addTarget(self, action: #selector(handleWheelPan(_:)))
