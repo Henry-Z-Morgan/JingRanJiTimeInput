@@ -185,7 +185,7 @@ private struct SystemTimePicker: UIViewRepresentable {
         picker.addGestureRecognizer(tap)
         context.coordinator.observeWheelPans(in: picker)
         container.selectionOverlay.apply(time: time, controlMode: controlMode, visible: showsSelectionOverlay, animated: false)
-        DispatchQueue.main.async { container.alignSelectionOverlayToPickerColumns() }
+        container.requestSelectionOverlayAlignment()
         return container
     }
 
@@ -195,7 +195,7 @@ private struct SystemTimePicker: UIViewRepresentable {
         picker.layoutIfNeeded()
         context.coordinator.observeWheelPans(in: picker)
         container.selectionOverlay.apply(time: time, controlMode: controlMode, visible: showsSelectionOverlay, animated: true)
-        DispatchQueue.main.async { container.alignSelectionOverlayToPickerColumns() }
+        container.requestSelectionOverlayAlignment()
 
         let timeChanged = context.coordinator.displayedTime != time
         let controlModeChanged = context.coordinator.displayedControlMode != controlMode
@@ -279,6 +279,8 @@ private struct SystemTimePicker: UIViewRepresentable {
 private final class TimePickerContainerView: UIView {
     let picker = UIPickerView()
     let selectionOverlay: TimePickerSelectionOverlay
+    private var pendingAlignmentAttempts = 0
+    private let maximumAlignmentAttempts = 3
     init(appearance: TimeInputPickerAppearance) {
         selectionOverlay = TimePickerSelectionOverlay(appearance: appearance)
         super.init(frame: .zero)
@@ -293,10 +295,27 @@ private final class TimePickerContainerView: UIView {
         ])
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    func alignSelectionOverlayToPickerColumns() {
+
+    /// `UIPickerView` 的行视图会在容器首次进入窗口后的后续布局周期才创建。
+    /// 不能在第一个 run loop 读不到行时长期使用 1/3、2/3 的兜底位置，
+    /// 否则两个选中值会向中间偏移，必须等用户点击才有下一次对齐机会。
+    func requestSelectionOverlayAlignment() {
+        pendingAlignmentAttempts = 0
+        alignSelectionOverlayToPickerColumnsWhenReady()
+    }
+
+    private func alignSelectionOverlayToPickerColumnsWhenReady() {
+        picker.layoutIfNeeded()
         let hourRow = picker.view(forRow: picker.selectedRow(inComponent: 0), forComponent: 0)
         let minuteRow = picker.view(forRow: picker.selectedRow(inComponent: 1), forComponent: 1)
-        guard let hourRow, let minuteRow else { return }
+        guard let hourRow, let minuteRow else {
+            guard pendingAlignmentAttempts < maximumAlignmentAttempts else { return }
+            pendingAlignmentAttempts += 1
+            DispatchQueue.main.async { [weak self] in
+                self?.alignSelectionOverlayToPickerColumnsWhenReady()
+            }
+            return
+        }
         selectionOverlay.setColumnCenters(
             hour: hourRow.superview?.convert(hourRow.center, to: self) ?? hourRow.convert(CGPoint(x: hourRow.bounds.midX, y: hourRow.bounds.midY), to: self),
             minute: minuteRow.superview?.convert(minuteRow.center, to: self) ?? minuteRow.convert(CGPoint(x: minuteRow.bounds.midX, y: minuteRow.bounds.midY), to: self)
