@@ -68,7 +68,7 @@ public struct TimeInputPickerBehavior {
 
 /// 可直接嵌入 SwiftUI 的时间输入控件。
 ///
-/// 打开时数字键盘控制 `behavior.initialControlMode`（默认完整时间）；拖动滚轮会收起键盘，首次轻点滚轮只唤醒键盘。
+/// 打开时会先完成原生滚轮的布局和手势安装，再显示数字键盘；拖动滚轮会收起键盘，首次轻点滚轮只唤醒键盘。
 public struct TimeInputPicker: View {
     @Binding private var time: TimeInput
     private let appearance: TimeInputPickerAppearance
@@ -79,7 +79,10 @@ public struct TimeInputPicker: View {
 
     @State private var synchronizer: TimeInputSynchronizer
     @State private var selectionRequestID = 0
-    @State private var wantsKeyboard = true
+    @State private var keyboardRequestID = 0
+    @State private var wantsKeyboard = false
+    @State private var hasCompletedInitialPickerSetup = false
+    @State private var hasInteractedWithWheelDuringSetup = false
     @State private var awaitsKeyboardWakeAfterWheelDrag = false
 
     public init(
@@ -100,7 +103,7 @@ public struct TimeInputPicker: View {
             initialTime: time.wrappedValue,
             controlMode: behavior.initialControlMode
         ))
-        _wantsKeyboard = State(initialValue: behavior.opensKeyboardOnAppear)
+        _wantsKeyboard = State(initialValue: false)
     }
 
     public var body: some View {
@@ -113,6 +116,13 @@ public struct TimeInputPicker: View {
             selectionRequestID: selectionRequestID,
             showsSelectionOverlay: wantsKeyboard,
             appearance: appearance,
+            onReady: {
+                guard !hasCompletedInitialPickerSetup else { return }
+                hasCompletedInitialPickerSetup = true
+                guard behavior.opensKeyboardOnAppear, !hasInteractedWithWheelDuringSetup else { return }
+                wantsKeyboard = true
+                keyboardRequestID += 1
+            },
             onComponentTapped: { component, modeBeforeTouch in
                 if awaitsKeyboardWakeAfterWheelDrag {
                     synchronizer.selectControlMode(.fullTime)
@@ -121,8 +131,10 @@ public struct TimeInputPicker: View {
                     synchronizer.applyColumnTap(component, modeBeforeTouch: modeBeforeTouch)
                 }
                 wantsKeyboard = behavior.restoresKeyboardOnWheelTap
+                if behavior.restoresKeyboardOnWheelTap { keyboardRequestID += 1 }
             },
             onWheelDragBegan: {
+                hasInteractedWithWheelDuringSetup = true
                 synchronizer.beginWheelDrag()
                 awaitsKeyboardWakeAfterWheelDrag = behavior.restoresKeyboardOnWheelTap
                 if behavior.dismissesKeyboardOnWheelDrag { wantsKeyboard = false }
@@ -132,6 +144,7 @@ public struct TimeInputPicker: View {
         .background {
             NumberPadKeyCapture(
                 wantsKeyboard: $wantsKeyboard,
+                keyboardRequestID: keyboardRequestID,
                 onDigit: { digit in
                     synchronizer.insertDigit(digit)
                     selectionRequestID += 1
@@ -165,6 +178,7 @@ private struct SystemTimePicker: UIViewRepresentable {
     let selectionRequestID: Int
     let showsSelectionOverlay: Bool
     let appearance: TimeInputPickerAppearance
+    let onReady: () -> Void
     let onComponentTapped: (TimeInputControlMode, TimeInputControlMode) -> Void
     let onWheelDragBegan: () -> Void
 
@@ -173,8 +187,14 @@ private struct SystemTimePicker: UIViewRepresentable {
     func makeUIView(context: Context) -> TimePickerContainerView {
         let container = TimePickerContainerView(appearance: appearance)
         let picker = container.picker
+        let coordinator = context.coordinator
+        container.onPickerLayout = { [weak coordinator, weak picker, weak container] in
+            guard let coordinator, let picker, let container else { return }
+            coordinator.requestInitialPickerReadiness(in: picker, container: container)
+        }
         picker.delegate = context.coordinator
         picker.dataSource = context.coordinator
+        picker.reloadAllComponents()
         picker.selectRow(centeredRow(for: time.hour, component: 0), inComponent: 0, animated: false)
         picker.selectRow(centeredRow(for: time.minute, component: 1), inComponent: 1, animated: false)
         context.coordinator.displayedTime = time
@@ -183,9 +203,12 @@ private struct SystemTimePicker: UIViewRepresentable {
         tap.cancelsTouchesInView = false
         tap.delegate = context.coordinator
         picker.addGestureRecognizer(tap)
-        context.coordinator.observeWheelPansWhenReady(in: picker)
+        let wheelPan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleWheelPan(_:)))
+        wheelPan.cancelsTouchesInView = false
+        wheelPan.delegate = context.coordinator
+        picker.addGestureRecognizer(wheelPan)
         container.selectionOverlay.apply(time: time, controlMode: controlMode, visible: showsSelectionOverlay, animated: false)
-        container.requestSelectionOverlayAlignment()
+        context.coordinator.requestInitialPickerReadiness(in: picker, container: container)
         return container
     }
 
@@ -193,7 +216,7 @@ private struct SystemTimePicker: UIViewRepresentable {
         let picker = container.picker
         context.coordinator.parent = self
         picker.layoutIfNeeded()
-        context.coordinator.observeWheelPansWhenReady(in: picker)
+        context.coordinator.requestInitialPickerReadiness(in: picker, container: container)
         container.selectionOverlay.apply(time: time, controlMode: controlMode, visible: showsSelectionOverlay, animated: true)
         container.requestSelectionOverlayAlignment()
 
@@ -218,9 +241,10 @@ private struct SystemTimePicker: UIViewRepresentable {
         var displayedTime: TimeInput?
         var displayedControlMode: TimeInputControlMode?
         var lastSelectionRequestID = 0
-        private var observedPanIDs = Set<ObjectIdentifier>()
-        private let minimumWheelScrollViewCount = 2
-        private let maximumWheelObservationAttempts = 5
+        private var hasReportedInitialPickerReadiness = false
+        private var pendingInitialPickerReadinessAttempts = 0
+        private let maximumInitialPickerReadinessAttempts = 8
+        private var isHandlingWheelDrag = false
         private var tappedColumn: TimeInputControlMode?
         private var modeBeforeTap: TimeInputControlMode?
         private var ignoreTapUntil = Date.distantPast
@@ -254,29 +278,38 @@ private struct SystemTimePicker: UIViewRepresentable {
             tappedColumn = nil; modeBeforeTap = nil
         }
         @objc func handleWheelPan(_ recognizer: UIPanGestureRecognizer) {
-            guard recognizer.state == .began else { return }
-            ignoreTapUntil = Date().addingTimeInterval(0.4)
-            parent.onWheelDragBegan()
+            switch recognizer.state {
+            case .began:
+                guard !isHandlingWheelDrag else { return }
+                isHandlingWheelDrag = true
+                ignoreTapUntil = Date().addingTimeInterval(0.4)
+                parent.onWheelDragBegan()
+            case .cancelled, .ended, .failed:
+                isHandlingWheelDrag = false
+            default:
+                break
+            }
         }
-        /// `UIPickerView` 的内部滚轮滚动视图会在首次布局后的后续 run loop 才生成。
-        /// 首次弹窗时若只立即安装一次监听，用户直接拖动会发生在监听尚未挂载的窗口内，
-        /// 从而错过第一笔滑动。等待两个滚轮均就绪后再绑定，且重试次数受限，避免长期轮询。
-        func observeWheelPansWhenReady(in picker: UIView, remainingAttempts: Int? = nil) {
+        /// 首个拖动由挂在 `UIPickerView` 本身的公开手势直接接收，不依赖内部私有滚动视图。
+        /// 这里仅等待两个选中行都有真实坐标后，才允许宿主请求键盘并显示选中层。
+        func requestInitialPickerReadiness(in picker: UIPickerView, container: TimePickerContainerView) {
+            guard !hasReportedInitialPickerReadiness else { return }
             picker.layoutIfNeeded()
-            let wheelScrollViews = scrollViews(in: picker)
-            guard wheelScrollViews.count >= minimumWheelScrollViewCount else {
-                let attempts = remainingAttempts ?? maximumWheelObservationAttempts
-                guard attempts > 0 else { return }
+            let hourRow = picker.view(forRow: picker.selectedRow(inComponent: 0), forComponent: 0)
+            let minuteRow = picker.view(forRow: picker.selectedRow(inComponent: 1), forComponent: 1)
+            guard picker.window != nil, let hourRow, let minuteRow else {
+                guard pendingInitialPickerReadinessAttempts < maximumInitialPickerReadinessAttempts else { return }
+                pendingInitialPickerReadinessAttempts += 1
                 DispatchQueue.main.async { [weak self, weak picker] in
-                    guard let self, let picker else { return }
-                    self.observeWheelPansWhenReady(in: picker, remainingAttempts: attempts - 1)
+                    guard let self, let picker, let container = picker.superview as? TimePickerContainerView else { return }
+                    self.requestInitialPickerReadiness(in: picker, container: container)
                 }
                 return
             }
-            wheelScrollViews.forEach { scrollView in
-                let id = ObjectIdentifier(scrollView.panGestureRecognizer)
-                guard observedPanIDs.insert(id).inserted else { return }
-                scrollView.panGestureRecognizer.addTarget(self, action: #selector(handleWheelPan(_:)))
+            container.alignSelectionOverlay(hourRow: hourRow, minuteRow: minuteRow)
+            hasReportedInitialPickerReadiness = true
+            DispatchQueue.main.async { [weak self] in
+                self?.parent.onReady()
             }
         }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
@@ -288,13 +321,13 @@ private struct SystemTimePicker: UIViewRepresentable {
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer) -> Bool { gestureRecognizer is UITapGestureRecognizer && otherGestureRecognizer is UIPanGestureRecognizer }
         private func component(at location: CGPoint, picker: UIPickerView) -> TimeInputControlMode { location.x < picker.bounds.midX ? .hour : .minute }
-        private func scrollViews(in view: UIView) -> [UIScrollView] { view.subviews.compactMap { $0 as? UIScrollView } + view.subviews.flatMap { scrollViews(in: $0) } }
     }
 }
 
 private final class TimePickerContainerView: UIView {
     let picker = UIPickerView()
     let selectionOverlay: TimePickerSelectionOverlay
+    var onPickerLayout: (() -> Void)?
     private var pendingAlignmentAttempts = 0
     private let maximumAlignmentAttempts = 3
     init(appearance: TimeInputPickerAppearance) {
@@ -311,6 +344,11 @@ private final class TimePickerContainerView: UIView {
         ])
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        onPickerLayout?()
+    }
 
     /// `UIPickerView` 的行视图会在容器首次进入窗口后的后续布局周期才创建。
     /// 不能在第一个 run loop 读不到行时长期使用 1/3、2/3 的兜底位置，
@@ -332,6 +370,10 @@ private final class TimePickerContainerView: UIView {
             }
             return
         }
+        alignSelectionOverlay(hourRow: hourRow, minuteRow: minuteRow)
+    }
+
+    func alignSelectionOverlay(hourRow: UIView, minuteRow: UIView) {
         selectionOverlay.setColumnCenters(
             hour: hourRow.superview?.convert(hourRow.center, to: self) ?? hourRow.convert(CGPoint(x: hourRow.bounds.midX, y: hourRow.bounds.midY), to: self),
             minute: minuteRow.superview?.convert(minuteRow.center, to: self) ?? minuteRow.convert(CGPoint(x: minuteRow.bounds.midX, y: minuteRow.bounds.midY), to: self)
@@ -393,18 +435,20 @@ private final class TimePickerSelectionOverlay: UIView {
 
 private struct NumberPadKeyCapture: UIViewRepresentable {
     @Binding var wantsKeyboard: Bool
+    let keyboardRequestID: Int
     let onDigit: (Character) -> Void
     let onDelete: () -> Void
     func makeUIView(context: Context) -> NumberPadCaptureTextField {
-        let field = NumberPadCaptureTextField(); field.onDigit = onDigit; field.onDelete = onDelete; field.shouldRequestKeyboard = wantsKeyboard; return field
+        let field = NumberPadCaptureTextField(); field.onDigit = onDigit; field.onDelete = onDelete; field.shouldRequestKeyboard = wantsKeyboard; field.keyboardRequestID = keyboardRequestID; return field
     }
-    func updateUIView(_ field: NumberPadCaptureTextField, context: Context) { field.onDigit = onDigit; field.onDelete = onDelete; field.shouldRequestKeyboard = wantsKeyboard }
+    func updateUIView(_ field: NumberPadCaptureTextField, context: Context) { field.onDigit = onDigit; field.onDelete = onDelete; field.shouldRequestKeyboard = wantsKeyboard; field.keyboardRequestID = keyboardRequestID }
 }
 
 private final class NumberPadCaptureTextField: UITextField, UITextFieldDelegate {
     var onDigit: ((Character) -> Void)?
     var onDelete: (() -> Void)?
     var shouldRequestKeyboard = false { didSet { synchronizeKeyboardState() } }
+    var keyboardRequestID = 0 { didSet { synchronizeKeyboardState() } }
     override init(frame: CGRect) {
         super.init(frame: frame)
         keyboardType = .numberPad; delegate = self; text = "\u{200B}"; tintColor = .clear; textColor = .clear; backgroundColor = .clear; accessibilityElementsHidden = true
@@ -419,6 +463,7 @@ private final class NumberPadCaptureTextField: UITextField, UITextFieldDelegate 
         guard window != nil else { return }
         if !shouldRequestKeyboard { if isFirstResponder { resignFirstResponder() }; return }
         guard !isFirstResponder else { return }
+        if becomeFirstResponder() { return }
         DispatchQueue.main.async { [weak self] in guard let self, self.shouldRequestKeyboard, self.window != nil, !self.isFirstResponder else { return }; self.becomeFirstResponder() }
     }
 }
