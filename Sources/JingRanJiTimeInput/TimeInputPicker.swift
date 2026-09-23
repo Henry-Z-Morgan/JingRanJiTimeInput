@@ -68,7 +68,8 @@ public struct TimeInputPickerBehavior {
 
 /// 可直接嵌入 SwiftUI 的时间输入控件。
 ///
-/// 打开时会先完成原生滚轮的布局和手势安装，再显示数字键盘；拖动滚轮会收起键盘，首次轻点滚轮只唤醒键盘。
+/// 打开时原生滚轮与数字键盘并行准备；选中层只会在真实滚轮坐标可用后显示。
+/// 拖动滚轮会收起键盘，首次轻点滚轮只唤醒键盘。
 public struct TimeInputPicker: View {
     @Binding private var time: TimeInput
     private let appearance: TimeInputPickerAppearance
@@ -81,7 +82,8 @@ public struct TimeInputPicker: View {
     @State private var selectionRequestID = 0
     @State private var keyboardRequestID = 0
     @State private var wantsKeyboard = false
-    @State private var hasCompletedInitialPickerSetup = false
+    @State private var hasRequestedInitialKeyboard = false
+    @State private var isSelectionOverlayReady = false
     @State private var hasInteractedWithWheelDuringSetup = false
     @State private var awaitsKeyboardWakeAfterWheelDrag = false
 
@@ -114,14 +116,18 @@ public struct TimeInputPicker: View {
             ),
             controlMode: synchronizer.controlMode,
             selectionRequestID: selectionRequestID,
-            showsSelectionOverlay: wantsKeyboard,
+            // 选中条不随键盘显隐切换，避免系统原生选中区与自定义选中条宽度不同。
+            showsSelectionOverlay: isSelectionOverlayReady,
             appearance: appearance,
-            onReady: {
-                guard !hasCompletedInitialPickerSetup else { return }
-                hasCompletedInitialPickerSetup = true
+            onPickerAttachedToWindow: {
+                guard !hasRequestedInitialKeyboard else { return }
+                hasRequestedInitialKeyboard = true
                 guard behavior.opensKeyboardOnAppear, !hasInteractedWithWheelDuringSetup else { return }
                 wantsKeyboard = true
                 keyboardRequestID += 1
+            },
+            onSelectionOverlayReady: {
+                isSelectionOverlayReady = true
             },
             onComponentTapped: { component, modeBeforeTouch in
                 if awaitsKeyboardWakeAfterWheelDrag {
@@ -178,7 +184,8 @@ private struct SystemTimePicker: UIViewRepresentable {
     let selectionRequestID: Int
     let showsSelectionOverlay: Bool
     let appearance: TimeInputPickerAppearance
-    let onReady: () -> Void
+    let onPickerAttachedToWindow: () -> Void
+    let onSelectionOverlayReady: () -> Void
     let onComponentTapped: (TimeInputControlMode, TimeInputControlMode) -> Void
     let onWheelDragBegan: () -> Void
 
@@ -241,7 +248,8 @@ private struct SystemTimePicker: UIViewRepresentable {
         var displayedTime: TimeInput?
         var displayedControlMode: TimeInputControlMode?
         var lastSelectionRequestID = 0
-        private var hasReportedInitialPickerReadiness = false
+        private var hasReportedPickerAttachment = false
+        private var hasReportedSelectionOverlayReadiness = false
         private var pendingInitialPickerReadinessAttempts = 0
         private let maximumInitialPickerReadinessAttempts = 8
         private var isHandlingWheelDrag = false
@@ -291,13 +299,24 @@ private struct SystemTimePicker: UIViewRepresentable {
             }
         }
         /// 首个拖动由挂在 `UIPickerView` 本身的公开手势直接接收，不依赖内部私有滚动视图。
-        /// 这里仅等待两个选中行都有真实坐标后，才允许宿主请求键盘并显示选中层。
+        /// 键盘在滚轮进入窗口时即可并行请求；只有选中层需要等待两个真实行坐标。
         func requestInitialPickerReadiness(in picker: UIPickerView, container: TimePickerContainerView) {
-            guard !hasReportedInitialPickerReadiness else { return }
             picker.layoutIfNeeded()
+            guard picker.window != nil else {
+                return
+            }
+
+            if !hasReportedPickerAttachment {
+                hasReportedPickerAttachment = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.onPickerAttachedToWindow()
+                }
+            }
+
+            guard !hasReportedSelectionOverlayReadiness else { return }
             let hourRow = picker.view(forRow: picker.selectedRow(inComponent: 0), forComponent: 0)
             let minuteRow = picker.view(forRow: picker.selectedRow(inComponent: 1), forComponent: 1)
-            guard picker.window != nil, let hourRow, let minuteRow else {
+            guard let hourRow, let minuteRow else {
                 guard pendingInitialPickerReadinessAttempts < maximumInitialPickerReadinessAttempts else { return }
                 pendingInitialPickerReadinessAttempts += 1
                 DispatchQueue.main.async { [weak self, weak picker] in
@@ -307,9 +326,9 @@ private struct SystemTimePicker: UIViewRepresentable {
                 return
             }
             container.alignSelectionOverlay(hourRow: hourRow, minuteRow: minuteRow)
-            hasReportedInitialPickerReadiness = true
+            hasReportedSelectionOverlayReadiness = true
             DispatchQueue.main.async { [weak self] in
-                self?.parent.onReady()
+                self?.parent.onSelectionOverlayReady()
             }
         }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
